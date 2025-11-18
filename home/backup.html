@@ -1,0 +1,1010 @@
+using UnityEngine;
+using TMPro;
+using UnityEngine.Android;
+using UnityEngine.Networking;
+using System.Collections;
+using System.Collections.Generic;
+using System;
+using System.Linq;
+using System.Globalization;
+
+public class ARControl : MonoBehaviour
+{
+    [Header("References")]
+    public GameObject arSessionOrigin;  // Assign XR Origin in Inspector
+    public GameObject arSession;        // Assign AR Session in Inspector
+    public GameObject mainUICanvas;     // Assign the main UI Canvas in Inspector
+    public TMP_Text arCoordinateText;   // Assign TMP Text for AR coordinates display
+    public GameObject miniMapPlanePrefab; // Assign 3D plane prefab for mini-map
+    public GameObject arMarkerPrefab; // Assign AR marker prefab for POIs
+    public GameObject arrivalIndicatorPrefab; // Assign 3D prefab to show when arrived at POI
+    public SupabaseClient supabaseClient; // Assign SupabaseClient in Inspector
+
+    [Header("Map Settings")]
+    public string mapboxToken = "pk.eyJ1Ijoib3BvcDI5IiwiYSI6ImNtZm8za3Q1NjAxcTEyanF4ZjZraWowdjEifQ.jNxrXsiX7Davmhjmp4ihWw"; // Mapbox token
+
+    [Header("Supabase Settings")]
+    public string supabaseUrl = "https://xyyftberwxgynoholndm.supabase.co";
+    public string supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh5eWZ0YmVyd3hneW5vaG9sbmRtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTczMDQ2NDYsImV4cCI6MjA3Mjg4MDY0Nn0.B9TCQeLOjkLJ9KVn3vjUiHJDURZO4bJvOnzHvifVJ5c";
+    public string tableName = "ar_pois";
+
+    public float miniMapScale = 0.15f; // Adjustable scale for mini-map size
+    public float mapZoomLevel = 14f; // Adjustable zoom level for map (lower = more zoomed out)
+
+    [Header("Navigation")]
+    public POI selectedPOI; // POI selected from information panel for navigation
+    public float maxPOIDisplayDistance = 1000f; // Maximum distance in meters to display POIs
+    public float maxARDisplayDistance = 50f; // Maximum distance in meters to display AR objects
+
+    private bool isUpdatingCoordinates = false;
+    private GameObject miniMapInstance;
+    private Texture2D miniMapTexture;
+    private bool isUpdatingMap = false;
+    private float lastMapUpdateTime = 0f;
+    private float lastARUpdateTime = 0f;
+    private float lastCoordinateUpdateTime = 0f;
+    private List<POI> cachedPOIs = new List<POI>();
+    private List<GameObject> arMarkerInstances = new List<GameObject>();
+    private GameObject arrivalIndicatorInstance;
+    private const float ARRIVAL_DISTANCE_THRESHOLD = 10f; // Distance in meters to consider arrived at POI
+
+    private void Start()
+    {
+        // Request GPS permission if not already granted
+        if (!Permission.HasUserAuthorizedPermission(Permission.FineLocation))
+        {
+            Permission.RequestUserPermission(Permission.FineLocation);
+        }
+
+        // Enable gyroscope and compass
+        Input.gyro.enabled = true;
+        Input.compass.enabled = true;
+
+        // Start location service with proper initialization
+        StartLocationService();
+
+        // Cache POIs from Supabase directly
+        StartCoroutine(FetchPOIsFromSupabase());
+    }
+
+    private void CreateMockPOIsForTesting()
+    {
+        cachedPOIs = new List<POI>();
+
+        // Create mock POIs very close to default location for testing
+        POI mockPOI1 = new POI();
+        mockPOI1.label = "Test POI 1";
+        mockPOI1.lat = 37.7749f + 0.0001f; // Very close north
+        mockPOI1.lng = -122.4194f;
+        mockPOI1.color = "#FF0000"; // Red
+        mockPOI1.mark_type = "marker";
+        cachedPOIs.Add(mockPOI1);
+
+        POI mockPOI2 = new POI();
+        mockPOI2.label = "Test POI 2";
+        mockPOI2.lat = 37.7749f;
+        mockPOI2.lng = -122.4194f + 0.0001f; // Very close east
+        mockPOI2.color = "#00FF00"; // Green
+        mockPOI2.mark_type = "marker";
+        cachedPOIs.Add(mockPOI2);
+
+        POI mockPOI3 = new POI();
+        mockPOI3.label = "Test POI 3";
+        mockPOI3.lat = 37.7749f - 0.0001f; // Very close south
+        mockPOI3.lng = -122.4194f;
+        mockPOI3.color = "#0000FF"; // Blue
+        mockPOI3.mark_type = "marker";
+        cachedPOIs.Add(mockPOI3);
+
+        Debug.Log($"Created {cachedPOIs.Count} mock POIs for testing");
+    }
+
+    // Function to call when button is clicked
+    public void OpenAR()
+    {
+        // Hide main UI canvas
+        if (mainUICanvas != null)
+            mainUICanvas.SetActive(false);
+
+        // Enable AR objects
+        if (arSessionOrigin != null)
+            arSessionOrigin.SetActive(true);
+        if (arSession != null)
+            arSession.SetActive(true);
+
+        // Create and position mini-map
+        if (miniMapPlanePrefab != null && miniMapInstance == null)
+        {
+            miniMapInstance = Instantiate(miniMapPlanePrefab);
+            miniMapInstance.transform.SetParent(Camera.main.transform);
+            miniMapInstance.transform.localPosition = new Vector3(0f, -0.4f, 1f); // Center bottom position for wider view
+            miniMapInstance.transform.localRotation = Quaternion.Euler(0f, 0f, 0f);
+            // Don't override the prefab's scale - use the prefab's original scale
+            // The miniMapScale variable is now just for reference in the inspector
+            // miniMapInstance.transform.localScale = new Vector3(miniMapScale, miniMapScale, miniMapScale);
+
+
+            // Start loading map texture
+            StartCoroutine(LoadMiniMapTexture());
+        }
+
+        // Start updating coordinates
+        StartUpdatingCoordinates();
+
+        // Create AR markers for POIs (only if we have POIs and prefab and GPS is available)
+        // Limit to maximum 10 AR markers for performance
+        if (cachedPOIs.Count > 0 && arMarkerPrefab != null && Input.location.status == LocationServiceStatus.Running &&
+            Permission.HasUserAuthorizedPermission(Permission.FineLocation) && Input.location.isEnabledByUser)
+        {
+            Debug.Log($"Creating up to 10 AR markers for POIs within {maxARDisplayDistance}m range");
+            CreateARMarkers();
+        }
+        else
+        {
+            Debug.LogWarning($"Cannot create AR markers - POIs: {cachedPOIs.Count}, Prefab: {(arMarkerPrefab != null ? "assigned" : "null")}, GPS: {Input.location.status}");
+
+            // If no POIs but we have prefab and GPS is available, create a test marker to verify AR is working
+            if (cachedPOIs.Count == 0 && arMarkerPrefab != null && Input.location.status == LocationServiceStatus.Running &&
+                Permission.HasUserAuthorizedPermission(Permission.FineLocation) && Input.location.isEnabledByUser)
+            {
+                Debug.Log("Creating test AR marker since no POIs available but GPS is working");
+                CreateTestARMarker();
+            }
+        }
+
+        // Initialize update timers
+        lastMapUpdateTime = Time.time;
+        lastARUpdateTime = Time.time;
+        lastCoordinateUpdateTime = Time.time;
+
+        // Disable VSync for better performance on mobile
+        QualitySettings.vSyncCount = 0;
+        Application.targetFrameRate = 30; // Limit to 30 FPS for mobile performance
+    }
+
+    // Function to call from information panel navigation button
+    public void NavigateToPOI(POI poi)
+    {
+        // Find the POI in cached data to ensure we have the latest data
+        POI cachedPOI = cachedPOIs.Find(p => p != null && p.label == poi.label &&
+            Mathf.Approximately(p.lat, poi.lat) && Mathf.Approximately(p.lng, poi.lng));
+
+        if (cachedPOI != null)
+        {
+            selectedPOI = cachedPOI;
+            Debug.Log($"Selected POI from cached data: {selectedPOI.label} at ({selectedPOI.lat}, {selectedPOI.lng}) with color {selectedPOI.color}");
+        }
+        else
+        {
+            selectedPOI = poi;
+            Debug.LogWarning($"POI not found in cached data, using provided POI: {selectedPOI.label}");
+        }
+
+        OpenAR(); // Open AR mode with navigation to selected POI
+    }
+
+    // Function to navigate to POI by label (useful for external calls)
+    public void NavigateToPOIByLabel(string poiLabel)
+    {
+        POI foundPOI = cachedPOIs.Find(p => p != null && p.label == poiLabel);
+
+        if (foundPOI != null)
+        {
+            NavigateToPOI(foundPOI);
+        }
+        else
+        {
+            Debug.LogError($"POI with label '{poiLabel}' not found in cached data");
+        }
+    }
+
+    // Function to call when back button is clicked
+    public void CloseAR()
+    {
+        // Stop updating coordinates
+        StopUpdatingCoordinates();
+
+        // Disable AR objects
+        if (arSessionOrigin != null)
+            arSessionOrigin.SetActive(false);
+        if (arSession != null)
+            arSession.SetActive(false);
+
+        // Destroy mini-map
+        if (miniMapInstance != null)
+        {
+            Destroy(miniMapInstance);
+            miniMapInstance = null;
+        }
+
+        // Destroy all AR marker instances
+        foreach (GameObject marker in arMarkerInstances)
+        {
+            if (marker != null)
+            {
+                Destroy(marker);
+            }
+        }
+        arMarkerInstances.Clear();
+
+        // Destroy arrival indicator
+        if (arrivalIndicatorInstance != null)
+        {
+            Destroy(arrivalIndicatorInstance);
+            arrivalIndicatorInstance = null;
+        }
+
+
+        // Show main UI canvas
+        if (mainUICanvas != null)
+            mainUICanvas.SetActive(true);
+    }
+
+    private void StartUpdatingCoordinates()
+    {
+        if (!isUpdatingCoordinates)
+        {
+            isUpdatingCoordinates = true;
+            InvokeRepeating("UpdateARCoordinates", 0f, 0.1f); // Update every 0.1 seconds for faster response
+        }
+    }
+
+    private void StopUpdatingCoordinates()
+    {
+        if (isUpdatingCoordinates)
+        {
+            isUpdatingCoordinates = false;
+            CancelInvoke("UpdateARCoordinates");
+            if (arCoordinateText != null)
+                arCoordinateText.text = "";
+        }
+    }
+
+    private void Update()
+    {
+        // Update mini-map orientation based on camera direction (compass-like behavior)
+        // Only update every few frames for better performance
+        if (miniMapInstance != null && Time.frameCount % 3 == 0) // Update every 3rd frame
+        {
+            // Get camera's Y-axis rotation to determine facing direction
+            float cameraYRotation = Camera.main.transform.eulerAngles.y;
+
+            // Apply camera rotation to mini-map (compass behavior)
+            miniMapInstance.transform.localRotation = Quaternion.Euler(0f, cameraYRotation, 0f);
+
+            // Rotate the mini-map to face the user (rotate 180 degrees around Y axis)
+            miniMapInstance.transform.Rotate(0f, 180f, 0f);
+
+            // Don't modify the prefab's shape - preserve user's custom cylinder
+            // The circle.cs script should handle making it circular if needed
+        }
+    }
+
+    private void UpdateARCoordinates()
+    {
+        if (arCoordinateText == null) return;
+
+        // Throttle updates to every 0.5 seconds for better performance
+        if (Time.time - lastCoordinateUpdateTime < 0.5f) return;
+        lastCoordinateUpdateTime = Time.time;
+
+        if (!Permission.HasUserAuthorizedPermission(Permission.FineLocation))
+        {
+            arCoordinateText.text = "GPS Permission Required";
+            return;
+        }
+
+        if (!Input.location.isEnabledByUser)
+        {
+            arCoordinateText.text = "Please Enable GPS";
+            return;
+        }
+
+        // Check if location service is running
+        if (Input.location.status == LocationServiceStatus.Running)
+        {
+            float latitude = Input.location.lastData.latitude;
+            float longitude = Input.location.lastData.longitude;
+            arCoordinateText.text = $"{latitude:F7}, {longitude:F7}";
+
+            // Check if arrived at selected POI
+            CheckArrivalAtPOI(latitude, longitude);
+
+            // Update map less frequently (every 3 seconds instead of every 0.1s)
+            if (!isUpdatingMap && Time.time - lastMapUpdateTime > 3f)
+            {
+                lastMapUpdateTime = Time.time;
+                StartCoroutine(LoadMiniMapTexture());
+            }
+
+            // Update AR markers less frequently (every 2 seconds)
+            if (Time.time - lastARUpdateTime > 2f)
+            {
+                lastARUpdateTime = Time.time;
+                UpdateARMarkers();
+            }
+        }
+        else if (Input.location.status == LocationServiceStatus.Initializing)
+        {
+            arCoordinateText.text = "Initializing GPS...";
+        }
+        else if (Input.location.status == LocationServiceStatus.Failed)
+        {
+            arCoordinateText.text = "GPS Failed - Check Permissions";
+        }
+        else
+        {
+            arCoordinateText.text = "GPS Not Available";
+        }
+    }
+
+    private IEnumerator LoadMiniMapTexture()
+    {
+        isUpdatingMap = true;
+
+        float latitude, longitude;
+
+        // Use current GPS location if available, otherwise use a default location
+        if (Input.location.status == LocationServiceStatus.Running &&
+            Permission.HasUserAuthorizedPermission(Permission.FineLocation) &&
+            Input.location.isEnabledByUser)
+        {
+            latitude = Input.location.lastData.latitude;
+            longitude = Input.location.lastData.longitude;
+            Debug.Log($"Using real GPS location: ({latitude}, {longitude})");
+        }
+        else
+        {
+            // Default location (fallback when GPS is not available) - San Francisco for testing
+            latitude = 37.7749f;
+            longitude = -122.4194f;
+            Debug.Log($"Using default test location: ({latitude}, {longitude}) - GPS status: {Input.location.status}");
+        }
+
+        // Build markers string for user location and POIs
+        string markers = $"pin-l-circle+ffff00({longitude},{latitude})"; // User marker (yellow circle to represent user, will be rotated)
+
+        // Add two blue markers near user marker when GPS is not available
+        if (Input.location.status != LocationServiceStatus.Running ||
+            !Permission.HasUserAuthorizedPermission(Permission.FineLocation) ||
+            !Input.location.isEnabledByUser)
+        {
+            markers += $",pin-s-marker+0000ff({longitude + 0.001f},{latitude})"; // Blue marker to the east
+            markers += $",pin-s-marker+0000ff({longitude},{latitude + 0.001f})"; // Blue marker to the north
+        }
+
+        Debug.Log($"Building map markers. User location: ({latitude}, {longitude}), cached POIs: {cachedPOIs.Count}");
+
+        // Add ALL POI markers from cached Supabase data - Mapbox will handle visibility based on zoom and center
+        int poiCount = 0;
+        foreach (POI poi in cachedPOIs)
+        {
+            if (poi != null && !string.IsNullOrEmpty(poi.color))
+            {
+                Debug.Log($"Processing POI for map: {poi.label} at ({poi.lat}, {poi.lng}) color: {poi.color}");
+
+                // Clean color string (remove # if present)
+                string colorCode = poi.color.Replace("#", "");
+
+                // Highlight selected POI for navigation with different color
+                string markerColor = (selectedPOI != null && poi == selectedPOI) ? "0000ff" : colorCode; // Blue for navigation target
+
+                // Convert lat/lng to the correct order for Mapbox (lng,lat)
+                markers += $",pin-s-marker+{markerColor}({poi.lng},{poi.lat})";
+
+                poiCount++;
+                Debug.Log($"Added POI marker {poiCount} to map: {poi.label} with color {markerColor} at ({poi.lng},{poi.lat})");
+            }
+            else
+            {
+                Debug.LogWarning($"Skipping invalid POI: {poi?.label ?? "null"} - color: {poi?.color ?? "null"}");
+            }
+        }
+
+        Debug.Log($"Final markers string: {markers}");
+
+        // Add navigation path line if we have a selected POI and GPS is available
+        if (selectedPOI != null && Input.location.status == LocationServiceStatus.Running &&
+            Permission.HasUserAuthorizedPermission(Permission.FineLocation) &&
+            Input.location.isEnabledByUser)
+        {
+            // Create a path line from user to POI (simplified as a series of points)
+            markers += $",path-5+0000ff-0.5({longitude},{latitude};{selectedPOI.lng},{selectedPOI.lat})";
+        }
+
+        string mapUrl = $"https://api.mapbox.com/styles/v1/mapbox/streets-v11/static/{markers}/{longitude},{latitude},{mapZoomLevel},0,0/256x256@2x?access_token={mapboxToken}";
+
+        Debug.Log($"Generated map URL: {mapUrl}");
+        Debug.Log($"Map URL length: {mapUrl.Length} characters");
+
+        using (UnityWebRequest www = UnityWebRequestTexture.GetTexture(mapUrl))
+        {
+            yield return www.SendWebRequest();
+
+            if (www.result == UnityWebRequest.Result.Success)
+            {
+                miniMapTexture = ((DownloadHandlerTexture)www.downloadHandler).texture;
+
+                // Apply texture to mini-map plane
+                if (miniMapInstance != null)
+                {
+                    Renderer renderer = miniMapInstance.GetComponent<Renderer>();
+                    if (renderer != null)
+                    {
+                        renderer.material.mainTexture = miniMapTexture;
+                        Debug.Log($"Successfully loaded mini-map texture! Texture size: {miniMapTexture.width}x{miniMapTexture.height}");
+                        Debug.Log($"Markers included: {markers}");
+                    }
+                    else
+                    {
+                        Debug.LogError("Mini-map instance found but no Renderer component!");
+                    }
+                }
+                else
+                {
+                    Debug.LogError("Mini-map instance is null when trying to apply texture!");
+                }
+            }
+            else
+            {
+                Debug.LogError($"Failed to load mini-map: {www.error}");
+                Debug.LogError($"Response code: {www.responseCode}");
+                Debug.LogError($"Map URL was: {mapUrl}");
+
+                // Try to get more error details
+                if (www.downloadHandler != null)
+                {
+                    string errorText = www.downloadHandler.text;
+                    if (!string.IsNullOrEmpty(errorText))
+                    {
+                        Debug.LogError($"Server response: {errorText}");
+                    }
+                }
+            }
+        }
+
+        isUpdatingMap = false;
+    }
+
+    private void OnEnable()
+    {
+        // Start location service if not already started
+        StartLocationService();
+    }
+
+    private void StartLocationService()
+    {
+        Debug.Log("Starting location service...");
+
+        // Check if location service is enabled on device
+        if (!Input.location.isEnabledByUser)
+        {
+            Debug.LogError("Location service is not enabled on device");
+            return;
+        }
+
+        // Start location service with high accuracy
+        Input.location.Start(5f, 5f); // Desired accuracy: 5 meters, update distance: 5 meters
+
+        // Wait for initialization
+        int maxWait = 20; // Wait up to 20 seconds for initialization
+        while (Input.location.status == LocationServiceStatus.Initializing && maxWait > 0)
+        {
+            Debug.Log("Waiting for GPS initialization...");
+            System.Threading.Thread.Sleep(1000); // Wait 1 second
+            maxWait--;
+        }
+
+        if (Input.location.status == LocationServiceStatus.Failed)
+        {
+            Debug.LogError("Location service failed to initialize");
+        }
+        else if (Input.location.status == LocationServiceStatus.Running)
+        {
+            Debug.Log("Location service initialized successfully");
+        }
+        else
+        {
+            Debug.LogWarning("Location service status: " + Input.location.status);
+        }
+    }
+
+    private void OnDisable()
+    {
+        // Stop location service
+        Input.location.Stop();
+        StopUpdatingCoordinates();
+    }
+
+    private void CreateARMarkers()
+    {
+        if (arMarkerPrefab == null)
+        {
+            Debug.LogWarning("Cannot create AR markers: arMarkerPrefab is null - please assign it in the Inspector");
+            return;
+        }
+
+        if (cachedPOIs.Count == 0)
+        {
+            Debug.LogWarning("Cannot create AR markers: no POIs cached - check Supabase connection or mock data");
+            return;
+        }
+
+        // Filter POIs by distance from user location (for AR display, closer range than map)
+        List<POI> nearbyPOIs = GetNearbyPOIsForAR();
+
+        // Limit to maximum 10 AR markers for performance
+        if (nearbyPOIs.Count > 10)
+        {
+            // Sort by distance and take closest 10
+            nearbyPOIs.Sort((a, b) => CalculateDistance(a.lat, a.lng).CompareTo(CalculateDistance(b.lat, b.lng)));
+            nearbyPOIs = nearbyPOIs.GetRange(0, 10);
+        }
+
+        Debug.Log($"Creating {nearbyPOIs.Count} AR markers (limited to 10 for performance)");
+
+        foreach (POI poi in nearbyPOIs)
+        {
+            if (poi != null)
+            {
+                Debug.Log($"Creating AR marker for POI: {poi.label} at ({poi.lat}, {poi.lng})");
+
+                // Calculate distance and direction to POI
+                float distance = CalculateDistance(poi.lat, poi.lng);
+                Vector3 direction = CalculateDirection(poi.lat, poi.lng);
+
+                // Position marker at eye level in front of camera, with directional offset
+                float comfortableDistance = Mathf.Min(distance * 0.1f, 10f);
+                Vector3 markerPosition = Camera.main.transform.position + Camera.main.transform.forward * comfortableDistance;
+                markerPosition.y = Camera.main.transform.position.y + 1.6f; // Eye level
+                markerPosition += direction * 2f; // Add directional offset
+
+                GameObject markerInstance = Instantiate(arMarkerPrefab, markerPosition, Quaternion.identity);
+
+                // Scale marker based on distance (smaller when far, larger when close)
+                float scaleFactor = Mathf.Clamp(1f / (distance / 100f + 1f), 0.3f, 2f); // Scale between 0.3 and 2
+                markerInstance.transform.localScale = Vector3.one * scaleFactor;
+
+                // Set marker color based on POI color from cached data
+                if (!string.IsNullOrEmpty(poi.color))
+                {
+                    Renderer markerRenderer = markerInstance.GetComponent<Renderer>();
+                    if (markerRenderer != null)
+                    {
+                        Color markerColor;
+                        if (ColorUtility.TryParseHtmlString(poi.color, out markerColor))
+                        {
+                            markerRenderer.material.color = markerColor;
+                        }
+                        else
+                        {
+                            Debug.LogWarning($"Failed to parse color {poi.color} for POI {poi.label}");
+                        }
+                    }
+                }
+
+                // Add text component to show POI label/distance if available
+                TextMeshPro textMesh = markerInstance.GetComponent<TextMeshPro>();
+                if (textMesh != null)
+                {
+                    textMesh.text = $"{poi.label}\n{distance:F1}m"; // Use F1 for single decimal
+                }
+                else
+                {
+                    // Try regular TextMesh as fallback
+                    TextMesh regularTextMesh = markerInstance.GetComponent<TextMesh>();
+                    if (regularTextMesh != null)
+                    {
+                        regularTextMesh.text = $"{poi.label}\n{distance:F1}m";
+                    }
+                }
+
+                // Make the marker face the camera/user
+                markerInstance.transform.LookAt(Camera.main.transform);
+                markerInstance.transform.Rotate(0f, 180f, 0f); // Adjust rotation to face user properly
+
+                // Add subtle animation (bobbing effect) - only for markers within 20m
+                if (distance <= 20f)
+                {
+                    StartCoroutine(AnimateMarker(markerInstance));
+                }
+
+                // Update marker position and scale continuously
+                StartCoroutine(UpdateMarkerPosition(markerInstance, poi));
+
+                arMarkerInstances.Add(markerInstance);
+            }
+        }
+    }
+
+    private IEnumerator AnimateMarker(GameObject marker)
+    {
+        if (marker == null) yield break;
+
+        Vector3 originalPosition = marker.transform.position;
+        float animationSpeed = 1.5f; // Slower animation for better performance
+        float animationHeight = 0.2f; // Smaller animation height
+
+        while (marker != null && marker.activeInHierarchy)
+        {
+            float yOffset = Mathf.Sin(Time.time * animationSpeed) * animationHeight;
+            marker.transform.position = originalPosition + Vector3.up * yOffset;
+            yield return new WaitForSeconds(0.05f); // Update every 50ms instead of every frame
+        }
+    }
+
+    private IEnumerator UpdateMarkerPosition(GameObject marker, POI poi)
+    {
+        while (marker != null && marker.activeInHierarchy)
+        {
+            if (Input.location.status == LocationServiceStatus.Running)
+            {
+                // Recalculate distance and update position/scale
+                float distance = CalculateDistance(poi.lat, poi.lng);
+                Vector3 directionToPOI = CalculateDirection(poi.lat, poi.lng);
+
+                // Update position in front of camera
+                float comfortableDistance = Mathf.Min(distance * 0.1f, 10f);
+                Vector3 newPosition = Camera.main.transform.position + Camera.main.transform.forward * comfortableDistance;
+                newPosition.y = Camera.main.transform.position.y + 1.6f; // Eye level
+                newPosition += directionToPOI * 2f;
+
+                marker.transform.position = newPosition;
+
+                // Update scale based on distance
+                float scaleFactor = Mathf.Clamp(1f / (distance / 100f + 1f), 0.3f, 2f);
+                marker.transform.localScale = Vector3.one * scaleFactor;
+
+                // Keep facing the camera
+                marker.transform.LookAt(Camera.main.transform);
+                marker.transform.Rotate(0f, 180f, 0f);
+            }
+
+            yield return new WaitForSeconds(1f); // Update every second for better performance
+        }
+    }
+
+    private float CalculateDistance(float poiLat, float poiLng)
+    {
+        if (Input.location.status != LocationServiceStatus.Running) return 0f;
+
+        float userLat = Input.location.lastData.latitude;
+        float userLng = Input.location.lastData.longitude;
+
+        // Haversine formula for distance calculation
+        float dLat = (poiLat - userLat) * Mathf.Deg2Rad;
+        float dLng = (poiLng - userLng) * Mathf.Deg2Rad;
+
+        float a = Mathf.Sin(dLat / 2) * Mathf.Sin(dLat / 2) +
+                  Mathf.Cos(userLat * Mathf.Deg2Rad) * Mathf.Cos(poiLat * Mathf.Deg2Rad) *
+                  Mathf.Sin(dLng / 2) * Mathf.Sin(dLng / 2);
+
+        float c = 2 * Mathf.Atan2(Mathf.Sqrt(a), Mathf.Sqrt(1 - a));
+        float distance = 6371000 * c; // Earth radius in meters
+
+        return distance;
+    }
+
+    private Vector3 CalculateDirection(float poiLat, float poiLng)
+    {
+        if (Input.location.status != LocationServiceStatus.Running) return Vector3.forward;
+
+        float userLat = Input.location.lastData.latitude;
+        float userLng = Input.location.lastData.longitude;
+
+        // Calculate bearing (direction)
+        float dLng = (poiLng - userLng) * Mathf.Deg2Rad;
+
+        float x = Mathf.Sin(dLng) * Mathf.Cos(poiLat * Mathf.Deg2Rad);
+        float y = Mathf.Cos(userLat * Mathf.Deg2Rad) * Mathf.Sin(poiLat * Mathf.Deg2Rad) -
+                  Mathf.Sin(userLat * Mathf.Deg2Rad) * Mathf.Cos(poiLat * Mathf.Deg2Rad) * Mathf.Cos(dLng);
+
+        float bearing = Mathf.Atan2(x, y);
+
+        // Convert bearing to direction vector
+        return new Vector3(Mathf.Sin(bearing), 0f, Mathf.Cos(bearing));
+    }
+
+    private void CheckArrivalAtPOI(float userLat, float userLng)
+    {
+        if (selectedPOI == null || arrivalIndicatorInstance != null) return;
+
+        float distanceToPOI = CalculateDistance(selectedPOI.lat, selectedPOI.lng);
+
+        if (distanceToPOI <= ARRIVAL_DISTANCE_THRESHOLD)
+        {
+            // User has arrived at the POI - show arrival indicator
+            ShowArrivalIndicator(selectedPOI);
+
+            // Log arrival with POI details from cached data
+            Debug.Log($"🎯 Arrived at POI: {selectedPOI.label} (ID: {selectedPOI.id}, Color: {selectedPOI.color})");
+        }
+    }
+
+    private List<POI> GetNearbyPOIs()
+    {
+        List<POI> nearbyPOIs = new List<POI>();
+
+        if (Input.location.status != LocationServiceStatus.Running)
+        {
+            Debug.LogWarning("GPS not available - cannot filter nearby POIs");
+            return cachedPOIs; // Return all POIs if GPS is not available
+        }
+
+        foreach (POI poi in cachedPOIs)
+        {
+            if (poi != null)
+            {
+                float distance = CalculateDistance(poi.lat, poi.lng);
+                if (distance <= maxPOIDisplayDistance)
+                {
+                    nearbyPOIs.Add(poi);
+                    Debug.Log($"POI {poi.label} is within range: {distance:F1}m");
+                }
+            }
+        }
+
+        Debug.Log($"Found {nearbyPOIs.Count} nearby POIs out of {cachedPOIs.Count} total POIs");
+        return nearbyPOIs;
+    }
+
+    private List<POI> GetNearbyPOIsForAR()
+    {
+        List<POI> nearbyPOIs = new List<POI>();
+
+        if (Input.location.status != LocationServiceStatus.Running)
+        {
+            Debug.LogWarning("GPS not available - cannot filter nearby POIs for AR");
+            return new List<POI>(); // Return empty list if GPS is not available
+        }
+
+        foreach (POI poi in cachedPOIs)
+        {
+            if (poi != null)
+            {
+                float distance = CalculateDistance(poi.lat, poi.lng);
+                if (distance <= maxARDisplayDistance)
+                {
+                    nearbyPOIs.Add(poi);
+                    Debug.Log($"POI {poi.label} is within AR range: {distance:F1}m");
+                }
+            }
+        }
+
+        Debug.Log($"Found {nearbyPOIs.Count} nearby POIs for AR out of {cachedPOIs.Count} total POIs");
+        return nearbyPOIs;
+    }
+
+    private void ShowArrivalIndicator(POI poi)
+    {
+        if (arrivalIndicatorPrefab == null) return;
+
+        // Calculate position for the arrival indicator (floating above the POI location)
+        Vector3 direction = CalculateDirection(poi.lat, poi.lng);
+        Vector3 indicatorPosition = direction * 5f; // Position 5 units in front
+        indicatorPosition.y = 3f; // Float above ground level
+
+        arrivalIndicatorInstance = Instantiate(arrivalIndicatorPrefab, indicatorPosition, Quaternion.identity);
+
+        // Set arrival indicator color to match POI color from cached data
+        if (!string.IsNullOrEmpty(poi.color))
+        {
+            Renderer indicatorRenderer = arrivalIndicatorInstance.GetComponent<Renderer>();
+            if (indicatorRenderer != null)
+            {
+                Color poiColor;
+                if (ColorUtility.TryParseHtmlString(poi.color, out poiColor))
+                {
+                    indicatorRenderer.material.color = poiColor;
+                }
+            }
+        }
+
+        // Add text to show arrival message with POI details
+        TextMeshPro arrivalText = arrivalIndicatorInstance.GetComponent<TextMeshPro>();
+        if (arrivalText != null)
+        {
+            arrivalText.text = $"🎯 Arrived!\n{poi.label}";
+        }
+
+        // Make it face the camera
+        arrivalIndicatorInstance.transform.LookAt(Camera.main.transform);
+        arrivalIndicatorInstance.transform.Rotate(0f, 180f, 0f);
+
+        Debug.Log($"Arrived at POI from cached data: {poi.label} (Color: {poi.color})");
+    }
+
+    private void UpdateARMarkers()
+    {
+        // Only update if GPS is available
+        if (Input.location.status != LocationServiceStatus.Running ||
+            !Permission.HasUserAuthorizedPermission(Permission.FineLocation) ||
+            !Input.location.isEnabledByUser)
+        {
+            return;
+        }
+
+        // Destroy existing AR markers
+        foreach (GameObject marker in arMarkerInstances)
+        {
+            if (marker != null)
+            {
+                Destroy(marker);
+            }
+        }
+        arMarkerInstances.Clear();
+
+        // Recreate AR markers based on current position
+        if (cachedPOIs.Count > 0 && arMarkerPrefab != null)
+        {
+            Debug.Log("Updating AR markers based on current GPS position");
+            CreateARMarkers();
+        }
+    }
+
+    private bool IsPOIWithinMapView(POI poi, float centerLat, float centerLng, float zoomLevel)
+    {
+        // Calculate the approximate view bounds based on zoom level
+        // Higher zoom level = smaller area visible
+        // Mapbox tile size is 256x256 pixels, each tile covers approximately 360/2^zoom degrees
+        float degreesPerTile = 360f / Mathf.Pow(2f, zoomLevel);
+        // For a 256x256 map, we see about half a tile in each direction
+        float latRange = degreesPerTile * 0.25f; // Quarter tile height for more conservative bounds
+        float lngRange = degreesPerTile * 0.25f; // Quarter tile width
+
+        // Check if POI is within the map bounds
+        bool withinLatBounds = poi.lat >= (centerLat - latRange) && poi.lat <= (centerLat + latRange);
+        bool withinLngBounds = poi.lng >= (centerLng - lngRange) && poi.lng <= (centerLng + lngRange);
+
+        Debug.Log($"POI {poi.label} at ({poi.lat}, {poi.lng}) - Center: ({centerLat}, {centerLng}) - Ranges: lat±{latRange}, lng±{lngRange} - Within bounds: {withinLatBounds && withinLngBounds}");
+
+        return withinLatBounds && withinLngBounds;
+    }
+
+    private void CreateTestARMarker()
+    {
+        Debug.Log("Creating test AR marker at eye level");
+
+        // Create a test marker in front of the camera at eye level
+        Vector3 markerPosition = Camera.main.transform.position + Camera.main.transform.forward * 5f;
+        markerPosition.y = Camera.main.transform.position.y + 1.6f; // Eye level
+
+        GameObject testMarker = Instantiate(arMarkerPrefab, markerPosition, Quaternion.identity);
+
+        // Set a default color
+        Renderer markerRenderer = testMarker.GetComponent<Renderer>();
+        if (markerRenderer != null)
+        {
+            markerRenderer.material.color = Color.red;
+        }
+
+        // Add text
+        TextMesh textMesh = testMarker.GetComponent<TextMesh>();
+        if (textMesh != null)
+        {
+            textMesh.text = "TEST MARKER\n5m away";
+        }
+
+        // Make it face the camera
+        testMarker.transform.LookAt(Camera.main.transform);
+        testMarker.transform.Rotate(0f, 180f, 0f);
+
+        // Add animation
+        StartCoroutine(AnimateMarker(testMarker));
+
+        arMarkerInstances.Add(testMarker);
+
+        Debug.Log("Test AR marker created successfully");
+    }
+
+    private IEnumerator FetchPOIsFromSupabase()
+    {
+        // Supabase REST API endpoint for your table
+        string url = $"{supabaseUrl}/rest/v1/{tableName}?select=*";
+
+        Debug.Log($"Fetching POIs from: {url}");
+
+        UnityWebRequest request = UnityWebRequest.Get(url);
+
+        // Required headers
+        request.SetRequestHeader("apikey", supabaseKey);
+        request.SetRequestHeader("Authorization", $"Bearer {supabaseKey}");
+        request.SetRequestHeader("Content-Type", "application/json");
+
+        // Set timeout for mobile devices
+        request.timeout = 10; // 10 seconds timeout
+
+        // Send request
+        yield return request.SendWebRequest();
+
+        // Check for errors
+        if (request.result == UnityWebRequest.Result.Success)
+        {
+            string json = request.downloadHandler.text;
+            Debug.Log("✅ Data fetched successfully!");
+            Debug.Log($"Raw JSON response: {json}");
+
+            try
+            {
+                // Handle empty response
+                if (string.IsNullOrEmpty(json) || json.Trim() == "[]")
+                {
+                    Debug.Log("Empty POI data received, using mock data");
+                    CreateMockPOIsForTesting();
+                    yield break;
+                }
+
+                // Parse JSON array directly
+                POI[] pois = JsonUtility.FromJson<POIList>("{\"pois\":" + json + "}").pois;
+                cachedPOIs = new List<POI>(pois);
+                Debug.Log($"Successfully parsed {cachedPOIs.Count} POIs");
+
+                // Filter active POIs based on dates
+                cachedPOIs = FilterActivePOIs(cachedPOIs);
+
+                // Log details of each POI for debugging
+                foreach (POI poi in cachedPOIs)
+                {
+                    if (poi != null)
+                    {
+                        Debug.Log($"POI: {poi.label} at ({poi.lat}, {poi.lng}) color: {poi.color} mark_type: {poi.mark_type}");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"JSON parsing error: {e.Message}");
+                CreateMockPOIsForTesting();
+            }
+        }
+        else
+        {
+            string errorMsg = $"❌ Error fetching data: {request.error}";
+            if (request.downloadHandler != null && !string.IsNullOrEmpty(request.downloadHandler.text))
+            {
+                errorMsg += $" Response: {request.downloadHandler.text}";
+            }
+            Debug.LogError(errorMsg);
+            CreateMockPOIsForTesting();
+        }
+    }
+
+    private List<POI> FilterActivePOIs(List<POI> pois)
+    {
+        DateTime currentDate = DateTime.Now.Date; // Get current date without time
+        Debug.Log($"Current date for filtering: {currentDate.ToString("MM-dd-yyyy")}");
+
+        return pois.Where(poi =>
+        {
+            // Include permanent POIs (null or empty dates)
+            if (poi.dates == null || poi.dates.Length == 0)
+            {
+                Debug.Log($"Including permanent POI: {poi.label}");
+                return true;
+            }
+
+            // Check if any of the POI's dates are not outdated (current or future dates)
+            foreach (string dateStr in poi.dates)
+            {
+                Debug.Log($"Checking date '{dateStr}' for POI: {poi.label}");
+                if (DateTime.TryParseExact(dateStr, "MM-dd-yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime poiDate))
+                {
+                    Debug.Log($"Parsed date: {poiDate.ToString("MM-dd-yyyy")}, Current date: {currentDate.ToString("MM-dd-yyyy")}, Is future/current: {poiDate.Date >= currentDate}");
+                    if (poiDate.Date >= currentDate)
+                    {
+                        Debug.Log($"Including dated POI: {poi.label} (has valid date: {dateStr})");
+                        return true; // Include POI if it has at least one non-outdated date
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning($"Failed to parse date '{dateStr}' for POI: {poi.label}");
+                }
+            }
+
+            Debug.Log($"Excluding outdated POI: {poi.label}");
+            return false; // Exclude POI if all dates are outdated
+        }).ToList();
+    }
+
+}
